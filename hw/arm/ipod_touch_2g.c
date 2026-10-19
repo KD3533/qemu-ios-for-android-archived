@@ -11,8 +11,11 @@
 #include "hw/qdev-clock.h"
 #include "hw/arm/exynos4210.h"
 #include "hw/arm/ipod_touch_2g.h"
+#include "net/net.h"
 #include "target/arm/cpregs.h"
 #include "qemu/error-report.h"
+#include "qemu/timer.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 #define VMSTATE_IT2G_CPREG(name) \
         VMSTATE_UINT64(IT2G_CPREG_VAR_NAME(name), IPodTouchMachineState)
@@ -147,9 +150,11 @@ static char *ipod_touch_get_nand_path(Object *obj, Error **errp)
 
 static void ipod_touch_set_nand_path(Object *obj, const char *value, Error **errp)
 {
-    gboolean nand_exists = g_file_test(value, G_FILE_TEST_IS_DIR);
+    /* Accept either the per-page directory tree or a flat NAND image file. */
+    gboolean nand_exists = g_file_test(value, G_FILE_TEST_IS_DIR) ||
+                           g_file_test(value, G_FILE_TEST_IS_REGULAR);
     if(!nand_exists) {
-        error_report("NAND at path \"%s\" must be a directory", value);
+        error_report("NAND at path \"%s\" must be a directory or an image file", value);
         exit(1);
     }
     
@@ -174,6 +179,10 @@ static inline qemu_irq s5l8900_get_irq(IPodTouchMachineState *s, int n)
     return s->irq[n / S5L8720_VIC_SIZE][n % S5L8720_VIC_SIZE];
 }
 
+const int S5L8900_GPIO_IRQS[S5L8900_NUM_GPIO_IRQS] = { S5L8900_GPIO_G0_IRQ, S5L8900_GPIO_G1_IRQ,
+                                   S5L8900_GPIO_G2_IRQ, S5L8900_GPIO_G3_IRQ,
+                                   S5L8900_GPIO_G4_IRQ };
+
 static uint32_t s5l8720_usb_hwcfg[] = {
     0,
     0x7a8f60d0,
@@ -181,7 +190,7 @@ static uint32_t s5l8720_usb_hwcfg[] = {
     0x01f08024
 };
 
-static void ipod_touch_key_event(void *opaque, int keycode)
+static void ipod_touch_apply_key_event(void *opaque, int keycode)
 {
     bool do_irq = false;
     int gpio_group = 0, gpio_selector = 0;
@@ -238,8 +247,67 @@ static void ipod_touch_key_event(void *opaque, int keycode)
     }
     else return;
     
-    s->sysic->gpio_int_status[gpio_group] |= (1 << gpio_selector);
-    qemu_irq_raise(s->sysic->gpio_irqs[gpio_group]);
+    ipod_touch_sysic_set_gpio_level(s->sysic, gpio_group, gpio_selector, !(keycode & KEY_UP));
+}
+
+// iOS debounces the buttons and ignores very short presses. VNC clients and
+// soft keyboards send key down and up almost together, so hold each button
+// for at least BUTTON_MIN_HOLD_MS of guest time before releasing it.
+#define BUTTON_MIN_HOLD_MS 100
+
+typedef struct IPodTouchButton {
+    void *opaque;
+    int keycode;
+    int64_t pressed_at;
+    QEMUTimer *release_timer;
+} IPodTouchButton;
+
+static IPodTouchButton ipod_touch_buttons[4];
+
+static IPodTouchButton *ipod_touch_button_for_key(int keycode)
+{
+    switch (keycode & ~KEY_UP) {
+        case KEY_P_DOWN:    return &ipod_touch_buttons[0];
+        case KEY_H_DOWN:    return &ipod_touch_buttons[1];
+        case KEY_MIN_DOWN:  return &ipod_touch_buttons[2];
+        case KEY_PLUS_DOWN: return &ipod_touch_buttons[3];
+        default:            return NULL;
+    }
+}
+
+static void ipod_touch_button_release(void *opaque)
+{
+    IPodTouchButton *b = (IPodTouchButton *)opaque;
+    ipod_touch_apply_key_event(b->opaque, b->keycode | KEY_UP);
+}
+
+static void ipod_touch_key_event(void *opaque, int keycode)
+{
+    IPodTouchButton *b = ipod_touch_button_for_key(keycode);
+    if (!b) {
+        return;
+    }
+
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
+    if (!b->release_timer) {
+        b->release_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, ipod_touch_button_release, b);
+    }
+    b->opaque = opaque;
+    b->keycode = keycode & ~KEY_UP;
+
+    if (!(keycode & KEY_UP)) {
+        // a press while a delayed release is pending just keeps the button down
+        if (timer_pending(b->release_timer)) {
+            timer_del(b->release_timer);
+        } else {
+            b->pressed_at = now;
+            ipod_touch_apply_key_event(opaque, keycode);
+        }
+    } else if (now - b->pressed_at < BUTTON_MIN_HOLD_MS) {
+        timer_mod(b->release_timer, b->pressed_at + BUTTON_MIN_HOLD_MS);
+    } else {
+        ipod_touch_apply_key_event(opaque, keycode);
+    }
 }
 
 static void ipod_touch_machine_init(MachineState *machine)
@@ -305,7 +373,9 @@ static void ipod_touch_machine_init(MachineState *machine)
     nms->sysic = (IPodTouchSYSICState *) g_malloc0(sizeof(struct IPodTouchSYSICState));
     memory_region_add_subregion(sysmem, SYSIC_MEM_BASE, &sysic_state->iomem);
     busdev = SYS_BUS_DEVICE(dev);
-    for(int grp = 0; grp < GPIO_NUMINTGROUPS; grp++) {
+    /* S5L8900_GPIO_IRQS only defines 5 groups, while GPIO_NUMINTGROUPS is 7 -
+     * iterating to GPIO_NUMINTGROUPS reads past the end of the array. */
+    for(int grp = 0; grp < S5L8900_NUM_GPIO_IRQS; grp++) {
         sysbus_connect_irq(busdev, grp, s5l8900_get_irq(nms, S5L8900_GPIO_IRQS[grp]));
     }
 
@@ -325,6 +395,9 @@ static void ipod_touch_machine_init(MachineState *machine)
     dev = qdev_new("ipodtouch.sdio");
     IPodTouchSDIOState *sdio_state = IPOD_TOUCH_SDIO(dev);
     nms->sdio_state = sdio_state;
+    /* Attach the WLAN device to a host network backend, so -netdev on the
+     * command line reaches the guest's en0. */
+    qdev_set_nic_properties(dev, &nd_table[0]);
     memory_region_add_subregion(sysmem, SDIO_MEM_BASE, &sdio_state->iomem);
     busdev = SYS_BUS_DEVICE(dev);
     sysbus_realize(busdev, &error_fatal);

@@ -1,5 +1,6 @@
 #include "hw/arm/ipod_touch_pcf50633_pmu.h"
 #include "hw/arm/ipod_touch_lcd.h"
+#include "hw/arm/ipod_touch_debug.h"
 
 static int pcf50633_event(I2CSlave *i2c, enum i2c_event event)
 {
@@ -32,7 +33,7 @@ static int int_to_bcd(int value) {
 static uint8_t pcf50633_recv(I2CSlave *i2c)
 {
     Pcf50633State *s = PCF50633(i2c);
-    printf("Reading PMU register %d\n", s->cmd);
+    // printf("Reading PMU register %d\n", s->cmd);
 
     time_t t = time(NULL);
     struct tm tm = *localtime(&t);
@@ -77,6 +78,10 @@ static uint8_t pcf50633_recv(I2CSlave *i2c)
             res = 0;
     }
 
+    /* The guest's driver is AppleD1759PMU, a different part from the PCF50633
+     * this model is written for, so its register map (RTC included) is not
+     * this one. Log every read to stderr, which the launcher captures. */
+    // fprintf(stderr, "pmu: read reg 0x%02x -> 0x%02x\n", s->cmd, res & 0xff);
     s->cmd += 1;
     return res;
 }
@@ -94,7 +99,7 @@ static int pcf50633_send(I2CSlave *i2c, uint8_t data)
         s->cmd = data;
     }
 
-    printf("Writing PMU register cmd %d reg %d\n", s->cmd, s->curreg);
+    // printf("Writing PMU register cmd %d reg %d\n", s->cmd, s->curreg);
     switch(s->curreg) {
         case PMU_DSBL1:
             lcd_changebrightness(s->cmd);

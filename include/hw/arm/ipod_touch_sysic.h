@@ -38,6 +38,13 @@ typedef struct IPodTouchSYSICState {
     uint32_t gpio_int_status[GPIO_NUMINTGROUPS];
     uint32_t gpio_int_enabled[GPIO_NUMINTGROUPS];
     uint32_t gpio_int_type[GPIO_NUMINTGROUPS];
+
+    // level of the pins driven by the emulator (the hardware buttons); each
+    // fires its interrupt while it is at the level armed in gpio_int_level
+    uint32_t gpio_pin_level[GPIO_NUMINTGROUPS];
+    uint32_t gpio_pin_driven[GPIO_NUMINTGROUPS];
 } IPodTouchSYSICState;
+
+void ipod_touch_sysic_set_gpio_level(IPodTouchSYSICState *s, int group, int pin, bool level);
 
 #endif

@@ -1,5 +1,42 @@
 #include "hw/arm/ipod_touch_sysic.h"
 
+// iOS flips a button's bit in GPIO_INTLEVEL after each interrupt so that the
+// next one fires on the opposite edge, and reads it back to tell press from
+// release. Treat driven pins as level-triggered: pending while at that level.
+static void ipod_touch_sysic_update_gpio_group(IPodTouchSYSICState *s, int group)
+{
+    uint32_t active = s->gpio_pin_driven[group] & ~(s->gpio_pin_level[group] ^ s->gpio_int_level[group]);
+    s->gpio_int_status[group] |= active;
+
+    if (s->gpio_int_status[group] & s->gpio_int_enabled[group] & s->gpio_pin_driven[group]) {
+        qemu_irq_raise(s->gpio_irqs[group]);
+    }
+}
+
+void ipod_touch_sysic_set_gpio_level(IPodTouchSYSICState *s, int group, int pin, bool level)
+{
+    s->gpio_pin_driven[group] |= (1 << pin);
+    if (level) {
+        s->gpio_pin_level[group] |= (1 << pin);
+    } else {
+        s->gpio_pin_level[group] &= ~(1 << pin);
+    }
+    ipod_touch_sysic_update_gpio_group(s, group);
+}
+#include "hw/arm/ipod_touch_debug.h"
+#include "qemu/error-report.h"
+
+/* Report registers this model does not implement: they read as zero, and a
+ * guest polling one for a ready bit waits forever with nothing in the log. */
+#define UNHANDLED_READ(dev, a) do { \
+    static uint32_t seen_[64]; static int nseen_; \
+    bool dup_ = false; \
+    for (int i_ = 0; i_ < nseen_; i_++) { \
+        if (seen_[i_] == (uint32_t)(a)) { dup_ = true; break; } } \
+    if (!dup_ && nseen_ < 64) { seen_[nseen_++] = (uint32_t)(a); \
+        warn_report("%s: unhandled read at 0x%03x -> 0", dev, (uint32_t)(a)); } \
+} while (0)
+
 static uint64_t ipod_touch_sysic_read(void *opaque, hwaddr addr, unsigned size)
 {
     IPodTouchSYSICState *s = (IPodTouchSYSICState *) opaque;
@@ -38,6 +75,7 @@ static uint64_t ipod_touch_sysic_read(void *opaque, hwaddr addr, unsigned size)
       default:
         break;
     }
+    UNHANDLED_READ("sysic", addr);
     return 0;
 }
 
@@ -60,6 +98,10 @@ static void ipod_touch_sysic_write(void *opaque, hwaddr addr, uint64_t val, unsi
             break;
         case GPIO_INTLEVEL ... (GPIO_INTLEVEL + GPIO_NUMINTGROUPS * 4):
         {
+            uint8_t group = (addr - GPIO_INTLEVEL) / 4;
+            if (group >= GPIO_NUMINTGROUPS) { break; }
+            s->gpio_int_level[group] = val;
+            ipod_touch_sysic_update_gpio_group(s, group);
             break;
         }
         case GPIO_INTSTAT ... (GPIO_INTSTAT + GPIO_NUMINTGROUPS * 4):
@@ -70,6 +112,7 @@ static void ipod_touch_sysic_write(void *opaque, hwaddr addr, uint64_t val, unsi
             s->gpio_int_status[group] = s->gpio_int_status[group] & ~val;
 
             qemu_irq_lower(s->gpio_irqs[group]);
+            ipod_touch_sysic_update_gpio_group(s, group);
 
             break;
         }

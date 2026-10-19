@@ -21,7 +21,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(IPodTouchGPIOState, IPOD_TOUCH_GPIO)
 #define GPIO_BUTTON_VOLUP_IRQ   0x78
 #define GPIO_BUTTON_VOLDOWN_IRQ 0x62
 
-#define NUM_GPIO_PADS 0xC
+#define NUM_GPIO_PADS 0xD // pads 0x0-0xC; the buttons live on pad 0xC
 #define NUM_GPIO_PINS 0x20
 
 #define GPIO2PIN(gpio)       ((gpio) & 7)

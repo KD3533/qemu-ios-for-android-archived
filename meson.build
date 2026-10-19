@@ -15,6 +15,11 @@ ss = import('sourceset')
 fs = import('fs')
 
 targetos = host_machine.system()
+# Python >= 3.13 reports 'android' on Android hosts (e.g. native Termux
+# builds); bionic is Linux, so take the Linux code paths.
+if targetos == 'android'
+  targetos = 'linux'
+endif
 sh = find_program('sh')
 config_host = keyval.load(meson.current_build_dir() / 'config-host.mak')
 
@@ -2268,7 +2273,11 @@ if targetos == 'windows'
 endif
 
 # has_function
-config_host_data.set('CONFIG_CLOSE_RANGE', cc.has_function('close_range'))
+# Functions that bionic declares only for newer API levels than the build
+# targets (e.g. Termux) are still exported by the libc stubs, so these checks
+# include the header: meson then requires a declaration, not just a symbol.
+unistd_prefix = gnu_source_prefix + '#include <unistd.h>'
+config_host_data.set('CONFIG_CLOSE_RANGE', cc.has_function('close_range', prefix: unistd_prefix))
 config_host_data.set('CONFIG_ACCEPT4', cc.has_function('accept4'))
 config_host_data.set('CONFIG_CLOCK_ADJTIME', cc.has_function('clock_adjtime'))
 config_host_data.set('CONFIG_DUP3', cc.has_function('dup3'))
@@ -2287,10 +2296,10 @@ config_host_data.set('CONFIG_PREADV', cc.has_function('preadv', prefix: '#includ
 config_host_data.set('CONFIG_PTHREAD_FCHDIR_NP', cc.has_function('pthread_fchdir_np'))
 config_host_data.set('CONFIG_SENDFILE', cc.has_function('sendfile'))
 config_host_data.set('CONFIG_SETNS', cc.has_function('setns') and cc.has_function('unshare'))
-config_host_data.set('CONFIG_SYNCFS', cc.has_function('syncfs'))
-config_host_data.set('CONFIG_SYNC_FILE_RANGE', cc.has_function('sync_file_range'))
+config_host_data.set('CONFIG_SYNCFS', cc.has_function('syncfs', prefix: unistd_prefix))
+config_host_data.set('CONFIG_SYNC_FILE_RANGE', cc.has_function('sync_file_range', prefix: gnu_source_prefix + '#include <fcntl.h>'))
 config_host_data.set('CONFIG_TIMERFD', cc.has_function('timerfd_create'))
-config_host_data.set('HAVE_COPY_FILE_RANGE', cc.has_function('copy_file_range'))
+config_host_data.set('HAVE_COPY_FILE_RANGE', cc.has_function('copy_file_range', prefix: unistd_prefix))
 config_host_data.set('HAVE_GETIFADDRS', cc.has_function('getifaddrs'))
 config_host_data.set('HAVE_GLIB_WITH_SLICE_ALLOCATOR', glib_has_gslice)
 config_host_data.set('HAVE_OPENPTY', cc.has_function('openpty', dependencies: util))
@@ -2336,7 +2345,7 @@ config_host_data.set('CONFIG_FIEMAP',
                      cc.has_header('linux/fiemap.h') and
                      cc.has_header_symbol('linux/fs.h', 'FS_IOC_FIEMAP'))
 config_host_data.set('CONFIG_GETRANDOM',
-                     cc.has_function('getrandom') and
+                     cc.has_function('getrandom', prefix: '#include <sys/random.h>') and
                      cc.has_header_symbol('sys/random.h', 'GRND_NONBLOCK'))
 config_host_data.set('CONFIG_INOTIFY',
                      cc.has_header_symbol('sys/inotify.h', 'inotify_init'))

@@ -78,3 +78,44 @@ We are now ready to run the emulator from the build directory with the following
 ```
 
 If there are any issues running the above commands, please let me know by [opening an issue](https://github.com/devos50/qemu-ios/issues/new).
+
+### Running on Android (Termux)
+
+The emulator can be built and run natively on an arm64 Android device inside [Termux](https://f-droid.org/packages/com.termux/) (install it from F-Droid, not the Play Store). This is experimental.
+
+1. Get the source into Termux's home directory, for example with `pkg install git && git clone https://github.com/KD3533/qemu-ios-for-android.git`.
+2. Run the setup script. It downloads the firmware into `~/ipod/` (about 250 MB), packs the NAND into the flat image `~/ipod/nand.img` (1–3 GB of disk space), installs the dependencies, builds the emulator, and installs the `ipod` command. It is safe to re-run; finished steps are skipped. After updating the source, run it with `--rebuild`.
+   ```
+   bash qemu-ios/scripts/android/setup.sh
+   ```
+3. Install a VNC viewer, for example AVNC or bVNC.
+4. Start the iPod:
+   ```
+   ipod start
+   ```
+   The emulator starts in the background, and your VNC viewer opens on `localhost:5900` once it is ready.
+
+Controls: tap the screen for touch. With the viewer's keyboard, `h` is home, `p` is power, and `-` and `=` are volume. From Termux:
+```
+ipod home                # also: power, volup, voldown
+ipod power 3000          # hold for 3 seconds
+ipod status              # is it running?
+ipod log                 # follow the emulator output
+ipod stop                # shut it down
+ipod update              # rebuild after changing the source
+ipod reset               # factory reset: discard all changes made on the iPod
+ipod backups             # list the automatic backups
+ipod restore             # roll back to a backup (asks which one)
+```
+The iPod saves its changes (settings, photos, apps' data) into `~/ipod/nand.img`, so they survive a restart. The unpacked `~/ipod/nand` directory stays as the original, which `ipod reset` copies back. `ipod stop` ends the emulator like pulling the battery, which can leave iOS unable to boot, so turn the iPod off first (hold Power, slide to power off). Before each start, `ipod` backs up the image to `~/ipod/backups` and keeps the newest 3 (`IPOD_BACKUPS` changes the number, 0 turns backups off). Each backup takes about as much disk space as `nand.img`. If the iPod no longer boots, `ipod restore` rolls it back to the state before an earlier start. Its Wi-Fi is connected to the phone's network through QEMU's user-mode network: join the network in Settings → Wi-Fi.
+`ipod` keeps a Termux wake lock while the emulator runs, so Android does not stop it in the background. The firmware paths can be changed with `IPOD_BOOTROM`, `IPOD_NAND` and `IPOD_NOR`.
+
+#### Running by hand
+
+`setup.sh` builds with `scripts/android/termux-build.sh`. To run in the foreground instead of with `ipod`, for example with SDL on [Termux:X11](https://github.com/termux/termux-x11) (`termux-x11 :0 &`):
+```
+bash qemu-ios/scripts/android/run-ipod.sh ~/ipod/bootrom_240_4 ~/ipod/nand ~/ipod/nor_n72ap.bin
+```
+The script uses SDL on Termux:X11 if it is running, otherwise it serves VNC on `localhost:5900`. Set `DISPLAY_MODE=vnc` to force VNC. Extra arguments are passed to QEMU, for example `-d unimp`. Keep the NAND directory in `$HOME`, not on `/sdcard`: the emulator opens one file for every NAND page read, which is slow on shared storage.
+
+The QEMU monitor listens on a socket; `scripts/android/ipod-key.sh` sends commands to it (`ipod-key.sh monitor info status`).

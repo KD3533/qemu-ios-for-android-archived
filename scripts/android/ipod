@@ -1,0 +1,210 @@
+#!/data/data/com.termux/files/usr/bin/bash
+#
+# Control the iPod Touch 2G emulator in Termux (installed by setup.sh).
+#
+# Usage: ipod <command>
+#   start [--no-viewer]   start in the background and open a VNC viewer
+#                         (--no-viewer: just start, e.g. when called by the iPod app)
+#   stop                  shut the emulator down
+#   status                show whether it is running
+#   home | power | volup | voldown [hold_ms]   press a button
+#   log                   follow the emulator output
+#   update                rebuild after the source changed
+#   reset                 factory reset: discard all changes made on the iPod
+#   backups               list the automatic backups
+#   restore [n]           roll the iPod back to a backup (asks which one)
+#
+# Each start first backs up the NAND image into ~/ipod/backups (the newest
+# IPOD_BACKUPS, default 3, are kept), so a session that leaves the iPod
+# unbootable can be undone with "ipod restore".
+#
+# Files default to ~/ipod/{bootrom_240_4,nor_n72ap.bin} and the NAND image
+# ~/ipod/nand.img (falling back to the read-only ~/ipod/nand directory);
+# override with IPOD_BOOTROM, IPOD_NAND and IPOD_NOR.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SRC_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+IPOD_DIR="${IPOD_DIR:-$HOME/ipod}"
+BOOTROM="${IPOD_BOOTROM:-$IPOD_DIR/bootrom_240_4}"
+if [ -n "${IPOD_NAND:-}" ]; then
+    NAND="$IPOD_NAND"
+elif [ -f "$IPOD_DIR/nand.img" ]; then
+    NAND="$IPOD_DIR/nand.img"
+else
+    NAND="$IPOD_DIR/nand"
+fi
+NOR="${IPOD_NOR:-$IPOD_DIR/nor_n72ap.bin}"
+LOG="$IPOD_DIR/ipod.log"
+PIDFILE="$IPOD_DIR/ipod.pid"
+BACKUP_DIR="$IPOD_DIR/backups"
+KEEP_BACKUPS="${IPOD_BACKUPS:-3}"
+VNC_PORT=5900
+
+is_running() {
+    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+vnc_up() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$VNC_PORT") 2>/dev/null
+}
+
+# Newest first
+list_backups() {
+    ls -1 "$BACKUP_DIR"/nand-*.img 2>/dev/null | sort -r
+}
+
+# Copy the NAND image before the iPod changes it; keep the newest few copies.
+backup_nand() {
+    [ -f "$NAND" ] && [ "$KEEP_BACKUPS" -gt 0 ] || return 0
+    mkdir -p "$BACKUP_DIR"
+
+    local need_kb free_kb dest
+    need_kb=$(du -k "$NAND" | cut -f1)
+    free_kb=$(df -Pk "$BACKUP_DIR" | awk 'NR==2 {print $4}')
+    if [ "$free_kb" -lt $((need_kb + 1048576)) ]; then
+        echo "warning: not enough free space for a backup ($((need_kb / 1024)) MB needed); skipping it" >&2
+        return 0
+    fi
+
+    dest="$BACKUP_DIR/nand-$(date +%Y%m%d-%H%M%S).img"
+    echo "Backing up the iPod ($((need_kb / 1024)) MB)..."
+    cp --sparse=always "$NAND" "$dest.part" && mv "$dest.part" "$dest"
+    list_backups | tail -n +$((KEEP_BACKUPS + 1)) | while read -r old; do rm -f "$old"; done
+}
+
+backup_label() {
+    # nand-20261012-142233.img -> 2026-10-12 14:22:33
+    local n
+    n="$(basename "$1" .img)"; n="${n#nand-}"
+    echo "${n:0:4}-${n:4:2}-${n:6:2} ${n:9:2}:${n:11:2}:${n:13:2}"
+}
+
+cmd_backups() {
+    local i=1 f
+    if [ -z "$(list_backups)" ]; then
+        echo "no backups yet (one is made at each start)"
+        return 0
+    fi
+    list_backups | while read -r f; do
+        echo "  $i) $(backup_label "$f")   (state before the start at that time)"
+        i=$((i + 1))
+    done
+}
+
+cmd_restore() {
+    local backups choice target f
+    backups=()
+    while read -r f; do backups+=("$f"); done < <(list_backups)
+    if [ "${#backups[@]}" -eq 0 ]; then
+        echo "error: no backups in $BACKUP_DIR" >&2
+        exit 1
+    fi
+
+    choice="${1:-}"
+    if [ -z "$choice" ]; then
+        echo "Backups (newest first):"
+        cmd_backups
+        read -r -p "Restore which one? [1] " choice
+        choice="${choice:-1}"
+    fi
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#backups[@]}" ]; then
+        echo "error: no backup number '$choice'" >&2
+        exit 1
+    fi
+    target="${backups[$((choice - 1))]}"
+
+    read -r -p "Roll the iPod back to $(backup_label "$target")? Changes since then are lost. [y/N] " answer
+    case "$answer" in
+        y|Y|yes) ;;
+        *) echo "cancelled"; exit 1 ;;
+    esac
+    is_running && cmd_stop
+    cp --sparse=always "$target" "$IPOD_DIR/nand.img.part"
+    mv "$IPOD_DIR/nand.img.part" "$IPOD_DIR/nand.img"
+    echo "Restored $(backup_label "$target"). Start the iPod with: ipod start"
+}
+
+cmd_start() {
+    local viewer=1
+    [ "${1:-}" = "--no-viewer" ] && viewer=0
+
+    if is_running; then
+        echo "iPod is already running"
+    else
+        mkdir -p "$IPOD_DIR"
+        backup_nand
+        command -v termux-wake-lock >/dev/null && termux-wake-lock
+        # run-ipod.sh execs qemu, so $! is the emulator's pid
+        DISPLAY_MODE=vnc nohup bash "$SCRIPT_DIR/run-ipod.sh" "$BOOTROM" "$NAND" "$NOR" \
+            > "$LOG" 2>&1 < /dev/null &
+        echo $! > "$PIDFILE"
+        disown
+
+        echo -n "Starting iPod"
+        for _ in $(seq 1 30); do
+            vnc_up && break
+            if ! is_running; then
+                echo; echo "error: the emulator exited; last output:" >&2
+                tail -n 15 "$LOG" >&2
+                exit 1
+            fi
+            echo -n "."; sleep 1
+        done
+        echo
+        vnc_up || { echo "error: VNC did not come up; see $LOG" >&2; exit 1; }
+        echo "iPod is running (VNC localhost:$VNC_PORT)"
+    fi
+
+    if [ "$viewer" = 1 ]; then
+        am start -a android.intent.action.VIEW -d "vnc://localhost:$VNC_PORT" >/dev/null 2>&1 \
+            || echo "Open a VNC viewer on localhost:$VNC_PORT"
+    fi
+}
+
+cmd_stop() {
+    if ! is_running; then
+        echo "iPod is not running"
+    else
+        local pid
+        pid="$(cat "$PIDFILE")"
+        bash "$SCRIPT_DIR/ipod-key.sh" monitor quit >/dev/null 2>&1 || true
+        for _ in $(seq 1 10); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+        done
+        kill -0 "$pid" 2>/dev/null && kill "$pid"
+        echo "iPod stopped"
+    fi
+    rm -f "$PIDFILE"
+    command -v termux-wake-unlock >/dev/null && termux-wake-unlock
+    return 0
+}
+
+cmd_reset() {
+    if [ ! -d "$IPOD_DIR/nand/cs0" ]; then
+        echo "error: $IPOD_DIR/nand not found; run setup.sh first" >&2
+        exit 1
+    fi
+    read -r -p "Reset the iPod and discard all its changes? [y/N] " answer
+    case "$answer" in
+        y|Y|yes) ;;
+        *) echo "cancelled"; exit 1 ;;
+    esac
+    is_running && cmd_stop
+    python3 "$SCRIPT_DIR/nand-to-image.py" "$IPOD_DIR/nand" "$IPOD_DIR/nand.img"
+}
+
+case "${1:-}" in
+    start)  shift; cmd_start "$@" ;;
+    stop)   cmd_stop ;;
+    status) if is_running; then echo "running (pid $(cat "$PIDFILE"))"; else echo "stopped"; exit 1; fi ;;
+    home|power|volup|voldown) exec bash "$SCRIPT_DIR/ipod-key.sh" "$@" ;;
+    log)    exec tail -f "$LOG" ;;
+    update) make -C "$SRC_DIR/build-termux" -j"$(nproc)" ;;
+    reset)  cmd_reset ;;
+    backups) cmd_backups ;;
+    restore) shift; cmd_restore "$@" ;;
+    *)      sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
